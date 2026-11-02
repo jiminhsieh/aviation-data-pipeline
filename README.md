@@ -1,5 +1,5 @@
 #  Streaming Data Pipeline
-This repository is used for the streaming data pipeline.
+This repository is used for the data pipeline.
 
 ## Tech Stack
 PySpark
