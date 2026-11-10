@@ -149,6 +149,9 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
+# Local Databricks bundle state (workspace IDs, deployment metadata)
+/.databricks/
+
 # Environments
 .env
 .envrc

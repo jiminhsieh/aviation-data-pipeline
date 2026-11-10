@@ -1,0 +1,4 @@
+pyspark==3.5.0
+delta-spark==3.2.0
+fastavro==1.12.1
+python-snappy==0.7.3

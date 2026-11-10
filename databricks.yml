@@ -1,0 +1,53 @@
+bundle:
+  name: aviation-silver
+
+variables:
+  environment:
+    description: sit, uat or prod
+  catalog:
+    description: Catalog name from the workspace Terraform output
+  source_root:
+    description: Bronze UC volume root from the workspace Terraform output
+  checkpoint_root:
+    description: Checkpoint UC volume root from the workspace Terraform output
+  silver_run_as:
+    description: Silver service principal application ID from workspace Terraform
+  silver_policy_id:
+    description: Classic Jobs policy ID from workspace Terraform
+  spark_node_type_id:
+    description: Same Jobs node type used when creating the Terraform policy
+
+resources:
+  jobs:
+    bronze_silver:
+      name: aviation-${var.environment}-bronze-silver
+      run_as:
+        service_principal_name: ${var.silver_run_as}
+      continuous:
+        pause_status: PAUSED # Unpause only after UC storage/fixture checks; never start a second writer.
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: bronze_to_silver
+          job_cluster_key: silver
+          spark_python_task:
+            python_file: ./bronze_silver/stream.py
+            parameters:
+              - --source-root
+              - ${var.source_root}
+              - --checkpoint
+              - ${var.checkpoint_root}/opensky/bronze_to_silver
+              - --table
+              - ${var.catalog}.silver.aircraft_states
+      job_clusters:
+        - job_cluster_key: silver
+          new_cluster:
+            spark_version: 15.4.x-scala2.12 # DBR LTS, Spark 3.5.0; validate on provisioned runtime.
+            node_type_id: ${var.spark_node_type_id}
+            num_workers: 1
+            policy_id: ${var.silver_policy_id}
+            data_security_mode: SINGLE_USER
+            single_user_name: ${var.silver_run_as}
+            spark_conf:
+              spark.sql.session.timeZone: UTC
+              spark.sql.files.ignoreCorruptFiles: "false"
+              spark.sql.files.ignoreMissingFiles: "false"
