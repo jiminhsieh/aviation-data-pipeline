@@ -12,6 +12,10 @@ variables:
     description: Checkpoint UC volume root from the workspace Terraform output
   silver_run_as:
     description: Silver service principal application ID from workspace Terraform
+  gold_run_as:
+    description: Gold SQL service principal application ID from workspace Terraform
+  gold_warehouse_id:
+    description: Pro SQL warehouse ID from workspace Terraform
   silver_policy_id:
     description: Classic Jobs policy ID from workspace Terraform
   spark_node_type_id:
@@ -51,3 +55,21 @@ resources:
               spark.sql.session.timeZone: UTC
               spark.sql.files.ignoreCorruptFiles: "false"
               spark.sql.files.ignoreMissingFiles: "false"
+    silver_to_gold:
+      name: aviation-${var.environment}-silver-to-gold
+      run_as:
+        service_principal_name: ${var.gold_run_as}
+      schedule:
+        quartz_cron_expression: "0 0/2 * * * ?"
+        timezone_id: UTC
+        pause_status: PAUSED # Unpause after provisioned validation; keep one Gold writer.
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: refresh_gold
+          sql_task:
+            warehouse_id: ${var.gold_warehouse_id}
+            file:
+              path: ${workspace.file_path}/sql/silver_to_gold.sql
+              source: WORKSPACE
+            parameters:
+              catalog: ${var.catalog}

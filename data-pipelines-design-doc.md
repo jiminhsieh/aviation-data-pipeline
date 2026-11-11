@@ -13,9 +13,9 @@ AKS collector → hourly ADLS Bronze Avro
                     Gold Delta → analyst SQL
 ```
 
-**Status:** Bronze → Silver code, a paused continuous Job definition and local Spark/Delta tests are available. Provisioned DBR/UC/ADLS integration and replay are not yet verified; Gold SQL/jobs remain design only. In a parent platform checkout, see the [architecture and technical design](../references/thales-azure-data-platform-design.md).
+**Status:** Silver streaming and Gold SQL, separate paused Jobs and local Spark/Delta tests are available. Azure/Databricks deployment, hosted runtime, grants, replay and analyst access remain unverified. In a parent platform checkout, see the [architecture and technical design](../references/thales-azure-data-platform-design.md).
 
-## Planned Tech Stack
+## Tech Stack
 
 PySpark / Spark Structured Streaming, native Avro file reader, Delta Lake, Unity Catalog, Databricks Jobs, and Databricks SQL on a Pro or Serverless SQL warehouse. No Kafka, Auto Loader, file-arrival Job trigger or processed-file manifest is required.
 
@@ -68,10 +68,10 @@ Apply these steps to the **complete-hour batch reread**, not only the newly disc
 
 ## Implementation 2: Silver → Gold Scheduled SQL
 
-- Target managed table: `aviation.gold.aircraft_activity_5m`.
-- Execute a version-controlled **SQL file task on a Pro or Serverless SQL warehouse**, independently of the Silver stream. No separate PySpark Gold job is required.
-- Initially schedule every **two minutes in UTC**, with one active refresh. Gold's schedule and permissions are separate from the stream.
-- At PoC scale, recompute **all retained Silver** and publish with one atomic **`INSERT OVERWRITE TABLE`** statement. Preserve the existing Gold catalog object/grants. Do not use separately committed delete/insert statements.
+- Target Terraform-managed table: `<catalog>.gold.aircraft_activity_5m` (`aviation` in `sit`). The runnable derivation is [`sql/silver_to_gold.sql`](sql/silver_to_gold.sql), deployed by the independent `silver_to_gold` Job in [`databricks.yml`](databricks.yml).
+- Execute a version-controlled **SQL file task on the Terraform Pro SQL warehouse** (or a compatible Serverless warehouse), independently of the Silver stream. The task takes `catalog`, `gold_run_as` and `gold_warehouse_id` from that environment's Terraform outputs; no PySpark Gold job or stream callback is required.
+- Schedule every **two minutes in UTC**, with `max_concurrent_runs: 1`. Both Job schedules are initially paused until provisioned verification; unpause Gold separately after its first-run checks.
+- At PoC scale, recompute **all retained Silver** in a UTC SQL session and publish with one atomic **`INSERT OVERWRITE TABLE`** statement. Empty Silver clears Gold, including obsolete entire hourly partitions; failed SQL leaves the prior Delta version available. Preserve the existing Gold catalog object/schema/grants. Do not use dynamic partition overwrite, separately committed delete/insert statements or concurrent manual writers.
 - Full refresh handles retries and late historical data and removes obsolete country groups. Upsert-only aggregate MERGE can retain stale groups; additive counters inflate results on replay.
 - Benchmark full-scan cost at larger scale; introduce atomic affected-bucket replacement only when necessary. No file-completion ledger is needed for this SQL refresh.
 
@@ -79,15 +79,16 @@ Apply these steps to the **complete-hour batch reread**, not only the newly disc
 
 | Value | Meaning |
 |---|---|
-| `bucket_start_utc` | Five-minute interval derived from source snapshot time |
+| `bucket_hour_utc` | Physical full-date UTC hourly `TIMESTAMP` partition, truncated from the five-minute bucket (not hourly aggregation) |
+| `bucket_start_utc` | Logical five-minute UTC interval derived from source snapshot epoch seconds (`TIMESTAMP`) |
 | `origin_country` | Latest selected observation's registration-country proxy; missing/blank becomes `Unknown` |
 | `aircraft_count` | One latest observation per `(bucket, icao24)`, then count by country |
 | `avg_baro_altitude_m` | Mean of each counted aircraft's latest non-null barometric altitude **within that bucket**; never carry across buckets |
 | `altitude_sample_count` | Aircraft contributing a non-null altitude |
-| `last_source_time` | Latest selected source timestamp represented in the group |
-| `updated_at_utc` | SQL refresh time |
+| `last_source_time` | Latest selected source snapshot epoch **seconds** in the group (`BIGINT`) |
+| `updated_at_utc` | SQL refresh time (`TIMESTAMP`); not source time or queryability time |
 
-`origin_country` is **not** the aircraft's geographic location or operator country. Retain at least 24 hours of history after warm-up. In a parent platform checkout, the [Gold design and SQL example](../references/thales-azure-data-platform-design.md#8-gold-scheduled-databricks-sql-country-activity) defines the atomic refresh, including the latest-null/earlier-valid altitude case.
+`origin_country` is **not** the aircraft's geographic location or operator country. Silver's source country is unchanged; only Gold trims and converts blank/null to `Unknown`. Count one aircraft per bucket even when altitude is null; average only the latest non-null altitude per aircraft *within that bucket*, and report null average when no aircraft has a sample. Retain at least 24 hours of history after warm-up (about 30 days intended); an empty source cannot manufacture Gold rows. The SQL file is the executable contract, tested against local Delta fixtures.
 
 ## Recovery and Freshness
 
@@ -103,17 +104,17 @@ Apply these steps to the **complete-hour batch reread**, not only the newly disc
 
 Use separate non-human Run-as principals. The stream reads Bronze, writes its checkpoint and reads/modifies Silver. The SQL task reads Silver, reads/modifies Gold and uses its SQL warehouse. Neither needs OpenSky credentials or storage-account keys. Analysts receive read-only Silver/Gold access, not Bronze, checkpoints, secrets or write permissions.
 
-Terraform/platform bootstrap supplies the workspace/UC objects, Access Connector storage access, volumes, managed tables, principals/grants, Spark cluster policy and SQL warehouse. This submodule defines the Silver Job; Gold is not implemented. Runtime inputs include source root, protected checkpoint path, pinned schema/runtime, and table name. Do not put secrets in source control or Terraform state.
+Terraform/platform bootstrap supplies the workspace/UC objects, Access Connector storage access, volumes, managed tables, principals/grants, Spark cluster policy and SQL warehouse. This submodule defines separate Silver and Gold Jobs. Runtime inputs include source root, protected checkpoint path, pinned schema/runtime, Silver catalog, Gold catalog, SQL warehouse ID and both run-as application IDs. Do not put secrets in source control or Terraform state.
 
 ## Implementation and Verification Checklist
 
-Silver paths: [`bronze_silver/stream.py`](bronze_silver/stream.py), [`databricks.yml`](databricks.yml), [`tests/test_stream.py`](tests/test_stream.py) and the producer-written [`tests/fixtures/1793013825.avro`](tests/fixtures/1793013825.avro). Gold SQL and Job paths remain planned.
+Silver paths: [`bronze_silver/stream.py`](bronze_silver/stream.py), [`databricks.yml`](databricks.yml), [`tests/test_stream.py`](tests/test_stream.py) and the producer-written [`tests/fixtures/1793013825.avro`](tests/fixtures/1793013825.avro). Gold paths: [`sql/silver_to_gold.sql`](sql/silver_to_gold.sql), the separate Job in [`databricks.yml`](databricks.yml), and [`tests/test_gold.py`](tests/test_gold.py).
 
 - Implement/pin producer-compatible schemas and Spark Avro decoding; verify exact fixture values, all 17 positions, mixed numeric/boolean types, nulls and nested sensors.
 - Test hourly partition derivation, new directories, UTC hour/day boundaries, late files and valid zero-row snapshots.
 - Test a second snapshot preserving the earlier contents of its hour, multi-hour replacement, unrelated-hour preservation, explicit empty replacement and refusal of incomplete-source reads.
 - Test duplicate keys across full hours, deterministic survivors, invalid records, checkpoint restart and failure after Silver commit but before checkpoint advancement.
-- Test SQL retry, latest-country changes removing old groups, latest-null altitude fallback within the same bucket, all-null sample counts and late historical corrections.
+- Local Delta SQL fixtures cover retry, latest-country changes removing old groups, latest-null altitude fallback within the same bucket, all-null sample counts, UTC date boundaries, late historical corrections, empty Silver, and a failed query retaining prior Gold. Verify the same behavior on the provisioned SQL warehouse before unpausing.
 - Verify analyst access denies Bronze/checkpoints/secrets/write actions; run a bounded replay with no concurrent Silver writer.
 - Measure live end-to-end freshness, stream/warehouse uptime and actual cost. Continuously running Spark and frequent SQL refreshes have idle costs.
 - Provisioned verification is outstanding: validate/deploy the bundle, confirm rights and restart/replay on DBR 15.4 before resuming the trigger. Teardown must preserve the Bronze, Silver and checkpoint backup as required by retention policy.
@@ -131,7 +132,7 @@ PYTHONPATH=. .venv/bin/python -m unittest discover -s tests -v
 
 The Avro fixture is written by the pinned producer, not hand-authored JSON. Tests cover all positions, union branches, nulls/sensors, UTC hour derivation, late and duplicate files, rejections, empty-hour clearing, missing files and checkpoint restart. These **do not** prove Databricks identity, UC volume metadata, Delta privileges or the hosted runtime. Provision the [two-account platform and UC permissions](../infra/tf/README.md) first; the primary Bronze account has no blob soft delete, while the separate checkpoint account has 30-day blob soft delete and no automatic checkpoint expiry. Give the stream run-as read on Bronze, read/write on checkpoints and SELECT/MODIFY on Silver. Confirm Azure credentials and DBR `15.4.x-scala2.12` match the Terraform policy and Spark 3.5 union/metadata behavior.
 
-Deploy with the Databricks CLI from this directory (Azure CLI logged in as an operator authorized to deploy/run as the Silver principal). These Terraform outputs must be from the **same** environment; use the actual `spark_node_type_id` supplied to Terraform. Do not deploy over an active writer:
+Deploy with the Databricks CLI from this directory (Azure CLI logged in as an operator authorized to deploy/run as **both** Silver and Gold principals). These Terraform outputs must be from the **same** environment; use the actual `spark_node_type_id` supplied to Terraform. Do not deploy over an active writer:
 
 ```sh
 export DATABRICKS_HOST="$(terraform -chdir=../infra/tf/azure output -raw workspace_host)"
@@ -143,6 +144,8 @@ VARS=(
   --var "source_root=$(terraform -chdir=../infra/tf/workspace output -raw bronze_volume_root)"
   --var "checkpoint_root=$(terraform -chdir=../infra/tf/workspace output -raw checkpoint_volume_root)"
   --var "silver_run_as=$(terraform -chdir=../infra/tf/workspace output -raw silver_run_as)"
+  --var "gold_run_as=$(terraform -chdir=../infra/tf/workspace output -raw gold_run_as)"
+  --var "gold_warehouse_id=$(terraform -chdir=../infra/tf/workspace output -raw gold_warehouse_id)"
   --var "silver_policy_id=$(terraform -chdir=../infra/tf/workspace output -raw silver_policy_id)"
   --var "spark_node_type_id=<matching Terraform node type>"
 )
@@ -151,7 +154,7 @@ databricks bundle deploy --fail-on-active-runs "${VARS[@]}"
 databricks bundle summary "${VARS[@]}"
 ```
 
-The versioned Job is **PAUSED by default**. Inspect the uploaded Python task, cluster policy, run-as, checkpoint and permissions; copy `JOB_ID` from the bundle summary/job URL. Verify producer Avro in Bronze, including the empty/null `states` cases, and the protected checkpoint path. Then start exactly one writer:
+Both versioned Jobs are **PAUSED by default**. Inspect the uploaded Python task, cluster policy, run-as, checkpoint and permissions; copy `JOB_ID` from the bundle summary/job URL. Verify producer Avro in Bronze, including the empty/null `states` cases, and the protected checkpoint path. Then start exactly one writer:
 
 ```sh
 JOB_ID=<bundle Job ID>
@@ -170,7 +173,39 @@ databricks jobs list-runs --job-id "$JOB_ID" --active-only
 databricks jobs run-now "$JOB_ID" --json '{"python_params":["--source-root","/Volumes/<catalog>/bronze/opensky_states","--checkpoint","/Volumes/<catalog>/ops/streaming_checkpoints/opensky/bronze_to_silver","--table","<catalog>.silver.aircraft_states","--replay-from","<start_epoch>","--replay-to","<end_epoch>"]}'
 ```
 
-Wait for the replay run to succeed before another hour or resume; compare business keys/counts for every affected Silver UTC hour to the retained Bronze files and check unrelated hours stayed unchanged. `processed_at_utc` may differ on replay. When the independent Gold SQL Job is implemented, run `databricks jobs run-now <gold-job-id>` and verify Gold freshness **before** declaring end-to-end recovery; it is not deployable from this submodule yet. Resume the trigger with the UNPAUSED command above. If a checkpoint is missing/corrupt/incompatible, **stop**, back it up and explicitly approve a new checkpoint/replay plan: replay all retained hours that must be repaired, then reconcile/restore the stream's discovery state; a new checkpoint can rediscover data and cannot recover files older than file-source discovery bounds by itself. Never silently delete/reset the original checkpoint. For teardown, pause and stop the Job, back up its checkpoint, then review and run `databricks bundle destroy "${VARS[@]}"` to remove only the bundle-owned Job/code; preserve Bronze, the protected checkpoint backup and the Terraform-owned managed Silver table according to the recovery plan. Continuous Spark has idle cost even with no aircraft.
+Wait for the replay run to succeed before another hour or resume; compare business keys/counts for every affected Silver UTC hour to the retained Bronze files and check unrelated hours stayed unchanged. `processed_at_utc` may differ on replay. Run `databricks jobs run-now <gold-job-id>` and verify Gold freshness **before** declaring end-to-end recovery; the SQL task is independent of the Silver checkpoint. Resume the trigger with the UNPAUSED command above. If a checkpoint is missing/corrupt/incompatible, **stop**, back it up and explicitly approve a new checkpoint/replay plan: replay all retained hours that must be repaired, then reconcile/restore the stream's discovery state; a new checkpoint can rediscover data and cannot recover files older than file-source discovery bounds by itself. Never silently delete/reset the original checkpoint. For teardown, pause and stop the Job, back up its checkpoint, then review and run `databricks bundle destroy "${VARS[@]}"` to remove only the bundle-owned Job/code; preserve Bronze, the protected checkpoint backup and the Terraform-owned managed Silver table according to the recovery plan. Continuous Spark has idle cost even with no aircraft.
+
+## Running Gold and checking analyst access (provisioned)
+
+The same bundle deployment above uploads `sql/silver_to_gold.sql` as a **workspace SQL file**; `catalog` is a named SQL task parameter, not a secret. Get the **Gold** Job ID from `databricks bundle summary "${VARS[@]}"` (not the continuous Silver `JOB_ID`). Before any SQL refresh, verify Terraform created a Pro warehouse, the full-date `bucket_hour_utc TIMESTAMP` Gold partition and the expected eight columns in dictionary order. Verify the Gold run-as can use that warehouse, SELECT Silver and SELECT/MODIFY Gold, but cannot read Bronze/checkpoints or use OpenSky secrets. Keep Silver and Gold writers independent; do not create a second Gold Job/schedule for the same table.
+
+```sh
+GOLD_JOB_ID=<Gold Job ID from bundle summary>
+databricks jobs run-now "$GOLD_JOB_ID"   # wait for SUCCESS; check SQL file path/parameters and warehouse
+# After verifying SQL results and permissions, start the independent UTC two-minute schedule:
+databricks jobs update "$GOLD_JOB_ID" --json '{"new_settings":{"schedule":{"quartz_cron_expression":"0 0/2 * * * ?","timezone_id":"UTC","pause_status":"UNPAUSED"}}}'
+databricks jobs list-runs --job-id "$GOLD_JOB_ID" --active-only
+```
+
+As an **ATM analyst** with only `USE CATALOG`, `USE SCHEMA`, Gold SELECT and warehouse CAN_USE, run this in a UTC SQL editor session on that warehouse (replace `<catalog>` with the deployed catalog); confirm Silver access is optional and Bronze/checkpoint/secret/write access is denied. A scientist may additionally query Silver. Keep **both** predicates: hourly pruning can include 25 partitions, while the five-minute cutoff enforces exactly the rolling 24-hour window. No country filter converts registration-country into overflight country.
+
+```sql
+SET TIME ZONE 'UTC';
+
+SELECT bucket_start_utc, origin_country, aircraft_count,
+       avg_baro_altitude_m, altitude_sample_count, last_source_time, updated_at_utc
+FROM <catalog>.gold.aircraft_activity_5m
+WHERE bucket_hour_utc >= DATE_TRUNC('HOUR', CURRENT_TIMESTAMP() - INTERVAL 24 HOURS)
+  AND bucket_start_utc >= CURRENT_TIMESTAMP() - INTERVAL 24 HOURS
+  AND bucket_start_utc <= CURRENT_TIMESTAMP()
+ORDER BY bucket_start_utc DESC, origin_country;
+```
+
+After **at least 24 hours of source/Gold warm-up**, compare this query to Silver per `(bucket_start_utc, icao24)` and confirm an old partition disappears after an authorized correction and an empty Silver source clears Gold. For a short-lived deployment, use a **clearly labeled historical fixture** covering 24 hours instead; do not call a few minutes of live data 24-hour coverage. Check `MIN(bucket_start_utc)`, `MAX(bucket_start_utc)` and distinct `bucket_hour_utc` against available retained source, and verify the Gold schema/partition against the dictionary above. Run the local Gold fixtures with `PYSPARK_PYTHON=.venv/bin/python PYSPARK_DRIVER_PYTHON=.venv/bin/python .venv/bin/python -m unittest discover -s tests -p test_gold.py -v`; they exercise the SQL text but not UC/warehouse parameter binding or analyst identity.
+
+Monitor separately: source response `time` **even when `states` is null/empty**, successful Bronze publication, Silver checkpoint/progress and source hours, successful Gold SQL runs and Gold Delta commit/analyst queryability. Distinguish a healthy empty source (fresh source time, no new aircraft rows) from a stale collector, stuck Silver, or failed Gold SQL (old Gold remains queryable but stale). On SQL failure, inspect the independent Job, fix and rerun it without resetting Silver's checkpoint; the single overwrite either commits or leaves prior Gold. On backfill, serialize Silver replays, let them finish, rerun Gold and check old/new buckets before resuming.
+
+**Measurements required in a provisioned environment:** log sample source epoch timestamps alongside Bronze arrival, Silver commit, successful SQL refresh and first analyst-visible Gold time over at least one live hour; calculate p50/p95/max source-to-landing/Silver/Gold lag and report p95 source-to-Gold <5 minutes as a *target*, not an observed guarantee. Record SQL run duration/failure rate, full-retained-Silver scan bytes, Gold partitions/files, warehouse uptime/billed DBUs and local regional SKU rates; quote actual spend only from billing. Two-minute cadence can incur idle/scan cost. No live measurements, verified analyst role or deployed Job are asserted by this repository.
 
 ## Source Data Spec
 
